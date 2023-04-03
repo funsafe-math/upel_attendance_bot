@@ -24,6 +24,7 @@ find_package(spdlog REQUIRED)
 
 add_executable(upel_bot src/main.cpp)
 target_link_libraries(upel_bot PRIVATE cpr::cpr fmt::fmt nlohmann_json::nlohmann_json spdlog::spdlog simdjson)
+target_compile_options(upel_bot PRIVATE -Wall -Wextra -Wpedantic -Weffc++)
 
 #install(TARGETS upel_bot
 #    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})

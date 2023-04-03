@@ -7,14 +7,15 @@
 #include <nlohmann/json.hpp>
 #include <simdjson.h>
 #include <spdlog/spdlog.h>
+#include <utility>
 
 using json = nlohmann::json;
 using namespace simdjson; // optional
 
 struct Credentials
 {
-    std::string username;
-    std::string password;
+    std::string username = "";
+    std::string password = "";
     Credentials(const fs::path &filename_path)
     {
         std::ifstream file(filename_path);
@@ -46,18 +47,17 @@ std::string get_sesskey(cpr::Session &session)
     return sesskey;
 }
 
-cpr::Session login(const Credentials &creds)
+auto login(const Credentials &creds)
 {
     cpr::Session session;
+    session.SetHttpVersion(cpr::HttpVersion(cpr::HttpVersionCode::VERSION_2_0));
     session.SetUrl(cpr::Url{"https://upel.agh.edu.pl/login/index.php"});
     const auto r = session.Get();
-    //    std::cout << r.text << std::endl;
-    std::string  html     = r.text;
-    auto         start    = r.text.find("https://upel.agh.edu.pl/auth/saml2/login.php");
-    auto         length   = r.text.find('"', start + 1) - start;
-    std::string  next_url = html.substr(start, length);
+    std::string html = r.text;
+    auto start = r.text.find("https://upel.agh.edu.pl/auth/saml2/login.php");
+    auto length = r.text.find('"', start + 1) - start;
+    std::string next_url = html.substr(start, length);
     boost::replace_all(next_url, "amp;", "");
-    //    std::cout << next_url << "\n";
 
     session.SetUrl(cpr::Url{next_url});
     const auto r2 = session.Get();
@@ -65,8 +65,8 @@ cpr::Session login(const Credentials &creds)
     //    std::cout << "r2 status code : " << r2.status_code << '\n';
     //    std::cout << r2.url.str() << "\n";
     //    std::cout << r2.text << "\n";
-    auto url_str   = find_str_after(R"(<input type="hidden" name="url" value=")", r2.text);
-    auto skin_str  = find_str_after(R"(<input type="hidden" name="skin" value=")", r2.text);
+    auto url_str = find_str_after(R"(<input type="hidden" name="url" value=")", r2.text);
+    auto skin_str = find_str_after(R"(<input type="hidden" name="skin" value=")", r2.text);
     auto token_str = find_str_after(R"(<input id="token" type="hidden" name="token" value=")",
                                     r2.text);
     std::cout << "URL : " << url_str << '\n';
@@ -91,10 +91,9 @@ cpr::Session login(const Credentials &creds)
     boost::replace_all(saml_response, "amp;", "");
     session.SetUrl(cpr::Url("https://upel.agh.edu.pl/auth/saml2/sp/saml2-acs.php/upel.agh.edu.pl"));
     cpr::Parameters param = {{"RelayState", relay_state}, {"SAMLResponse", saml_response}};
-    session.SetParameters(cpr::Parameters{});
+    session.SetParameters(cpr::Parameters{}); // Reset parameters
     auto content = param.GetContent(*session.GetCurlHolder().get());
     session.SetBody(cpr::Body(content));
-    //    session.SetHttpVersion(cpr::HttpVersion(cpr::HttpVersionCode::VERSION_1_1));
     auto p2 = session.Post();
     std::cout << "Status code : " << p2.status_code << '\n';
     std::cout << "New url : " << p2.url.str() << '\n';
@@ -103,39 +102,33 @@ cpr::Session login(const Credentials &creds)
     session.SetUrl(p2.url);
     auto courses = session.Get();
     std::cout << "Got url : " << courses.url.str() << '\n';
-    //    std::cout << "Text: " << courses.text << '\n';
     auto full_username = find_str_after(R"(title="Zobacz profil">)", courses.text, '<');
     boost::algorithm::trim(full_username);
     fmt::print(fg(fmt::color::yellow), "Upel says your name is : {}\n", full_username);
 
     auto sesskey = find_str_after(R"(a href="https://upel.agh.edu.pl/login/logout.php?sesskey=)",
                                   courses.text);
-    return session;
+    return std::pair<cpr::Session, std::string>(std::move(session), std::move(sesskey));
 }
 
-std::map<std::string, int64_t> get_courses(cpr::Session &session)
+std::map<std::string, int64_t> get_courses(cpr::Session &session,
+                                           const std::string &sesskey,
+                                           ondemand::parser &parser)
 {
-    auto sesskey = get_sesskey(session);
-    auto courses_url = fmt::format(
-        "https://upel.agh.edu.pl/lib/ajax/"
-        "service.php?sesskey={}&info=core_course_get_enrolled_courses_by_timeline_classification",
-        sesskey);
+    //    auto sesskey = get_sesskey(session);
+    auto courses_url = fmt::format("https://upel.agh.edu.pl/lib/ajax/"
+                                   "service.php?sesskey={}&info=core_course_get_enrolled_"
+                                   "courses_by_timeline_classification",
+                                   sesskey);
 
     session.SetUrl(cpr::Url{courses_url});
     session.SetBody(cpr::Body(
         R"([{"index":0,"methodname":"core_course_get_enrolled_courses_by_timeline_classification","args":{"offset":0,"limit":0,"classification":"all","sort":"fullname","customfieldname":"","customfieldvalue":""}}])"));
     auto r = session.Get();
-    //    fmt::print("Got : {}\n", r.text);
-    ondemand::parser parser;
+    //    ondemand::parser parser;
     padded_string padded_text{r.text};
     auto doc = parser.iterate(padded_text);
     ondemand::array arr = doc.get_array();
-    //    auto error = (*arr.begin())["error"].get_bool().value();
-    //    if (error) {
-    //        auto exception = (*arr.begin())["exception"].get_string().value();
-    //        fmt::print(stderr, "Error in json : {}\n", exception);
-    //        exit(1);
-    //    }
     auto data = (*arr.begin())["data"]["courses"].get_array();
     fmt::print("Found courses :\n");
     std::map<std::string, int64_t> ret;
@@ -149,31 +142,29 @@ std::map<std::string, int64_t> get_courses(cpr::Session &session)
     return ret;
 }
 
-void get_course_items(cpr::Session &session, long course_id)
+std::optional<std::string> get_course_items(cpr::Session &session,
+                                            long course_id,
+                                            const std::string &session_key,
+                                            ondemand::parser &parser)
 {
-    auto session_key = get_sesskey(session);
+    //    auto session_key = get_sesskey(session);
     auto url = fmt::format("https://upel.agh.edu.pl/lib/ajax/"
                            "service.php?sesskey={}&info=core_courseformat_get_state",
                            session_key);
     session.SetUrl(cpr::Url{url});
-    //    auto body = fmt::format(
-    //        R"([\\{"index":0,"methodname":"core_courseformat_get_state","args":\\{"courseid":{}\\}\\}])",
-    //        course_id);
     auto body = R"([{"index":0,"methodname":"core_courseformat_get_state","args":{"courseid":)"
-                + std::to_string(1912) + " }}]";
+                + std::to_string(course_id) + " }}]";
     session.SetBody(cpr::Body{body});
     auto r = session.Post();
-    //    fmt::print("{}\n", r.text);
-    ondemand::parser parser;
+    //    ondemand::parser parser;
     padded_string padded_text{r.text};
     auto doc = parser.iterate(padded_text);
     ondemand::array arr = doc.get_array();
     auto data = (*arr.begin())["data"].get_string();
-    //    std::string data_str{data.value().data(), data.value().size()};
     padded_string data_str{data.value()};
     doc = parser.iterate(data_str);
-    //    std::cout << simdjson::to_json_string(doc.get_object()) << '\n';
-    ondemand::array cm = doc["cm"].get_array();
+    auto main_obj = doc.get_object();
+
     fmt::print("Detected sections:\n");
 
     struct NameUrl
@@ -183,16 +174,27 @@ void get_course_items(cpr::Session &session, long course_id)
     };
 
     std::vector<NameUrl> attendance;
-    for (ondemand::object it : cm) {
-        auto name = it.find_field_unordered("name").get_string().value();
-        auto url = it.find_field_unordered("url").get_string();
-        //        fmt::print("\t{} : {}\n", name, url.error() == 0 ? url.value() : "");
-        fmt::print("\t{}\n", name);
-        if (url.error())
+    for (ondemand::field field : main_obj) {
+        std::cout << "\t## " << field.key() << " ##\n";
+        auto arr = field.value().get_array();
+        if (arr.error())
             continue;
-        bool is_attendance = url.value().find("attendance") != std::string::npos;
-        if (is_attendance) {
-            attendance.push_back(NameUrl{name, url.value()});
+        for (ondemand::object it : arr) {
+            auto name = it.find_field_unordered("name").get_string();
+            if (name.error()) {
+                name = it.find_field_unordered("title").get_string();
+                if (name.error())
+                    continue;
+            }
+            auto url = it.find_field_unordered("url").get_string();
+            bool is_attendance = !url.error()
+                                 && url.value().find("attendance") != std::string::npos;
+            if (is_attendance) {
+                fmt::print(fg(fmt::color::yellow), "\t{}\n", name.value());
+                attendance.push_back(NameUrl{name.value(), url.value()});
+            } else {
+                fmt::print("\t{}\n", name.value());
+            }
         }
     }
     if (attendance.empty()) {
@@ -203,7 +205,8 @@ void get_course_items(cpr::Session &session, long course_id)
         // TODO:
     }
     fmt::print("Using attendance {}\n", attendance[0].name);
-    std::string sttendance_url{attendance[0].url.data(), attendance[0].url.size()};
+    std::string attendance_url{attendance[0].url.data(), attendance[0].url.size()};
+    return attendance_url;
 }
 
 int main(int argc, char *argv[])
@@ -216,14 +219,15 @@ int main(int argc, char *argv[])
 
     const fs::path credentials_path{argv[1]};
     Credentials creds(credentials_path);
-    auto session = login(creds);
-    auto courses = get_courses(session);
+    ondemand::parser json_parser{};
+    auto [session, sesskey] = login(creds);
+    auto courses = get_courses(session, sesskey, json_parser);
     auto cpp_it = std::find_if(courses.begin(), courses.end(), [](auto pair) {
         return pair.first.find("C++") != std::string::npos;
     });
     assert(cpp_it != courses.end());
     auto cpp_id = cpp_it->second;
-    get_course_items(session, cpp_id);
+    get_course_items(session, cpp_id, sesskey, json_parser);
 
     return 0;
 }
