@@ -1,6 +1,7 @@
 #include <boost/algorithm/string/replace.hpp>
 #include <boost/algorithm/string/trim.hpp>
 #include <cpr/cpr.h>
+#include <cstdio>
 #include <fmt/color.h>
 #include <fmt/printf.h>
 #include <iostream>
@@ -9,21 +10,10 @@
 #include <spdlog/spdlog.h>
 #include <utility>
 
-using json = nlohmann::json;
+#include "state.hpp"
+
 using namespace simdjson; // optional
 
-struct Credentials
-{
-    std::string username = "";
-    std::string password = "";
-    Credentials(const fs::path &filename_path)
-    {
-        std::ifstream file(filename_path);
-        std::getline(file, username, ':');
-        std::getline(file, password);
-        file.close();
-    }
-};
 
 std::string find_str_after(const std::string &start, const std::string &html, char delimiter = '"')
 {
@@ -47,20 +37,32 @@ std::string get_sesskey(cpr::Session &session)
     return sesskey;
 }
 
-auto login(const Credentials &creds)
+std::pair<cpr::Session, std::string> login(const Credentials &creds)
 {
     cpr::Session session;
     session.SetHttpVersion(cpr::HttpVersion(cpr::HttpVersionCode::VERSION_2_0));
-    session.SetUrl(cpr::Url{"https://upel.agh.edu.pl/login/index.php"});
-    const auto r = session.Get();
-    std::string html = r.text;
-    auto start = r.text.find("https://upel.agh.edu.pl/auth/saml2/login.php");
-    auto length = r.text.find('"', start + 1) - start;
-    std::string next_url = html.substr(start, length);
-    boost::replace_all(next_url, "amp;", "");
+    const cpr::Url upel_login_page_url = "https://upel.agh.edu.pl/login/index.php";
+    spdlog::info("Visiting {}", upel_login_page_url.c_str());
+    session.SetUrl(upel_login_page_url);
+    const auto upel_login_page_request = session.Get();
+    std::string html = upel_login_page_request.text;
 
+    const auto escape_ampersands = [](std::string &str){
+        boost::replace_all(str, "amp;", "");
+    };
+
+    const auto upel_saml2_url_begin = "https://upel.agh.edu.pl/auth/saml2/login.php";
+    auto start = upel_login_page_request.text.find(upel_saml2_url_begin);
+    auto length = upel_login_page_request.text.find('"', start + 1) - start;
+    std::string next_url = html.substr(start, length);
+    escape_ampersands(next_url);
+
+
+    
+    spdlog::info("Visiting {}", next_url.c_str());
     session.SetUrl(cpr::Url{next_url});
     const auto r2 = session.Get();
+    spdlog::info("Got response from: {}", r2.url.c_str());
     //    std::cout << "r2 redirects : " << r2.redirect_count << '\n';
     //    std::cout << "r2 status code : " << r2.status_code << '\n';
     //    std::cout << r2.url.str() << "\n";
@@ -69,35 +71,45 @@ auto login(const Credentials &creds)
     auto skin_str = find_str_after(R"(<input type="hidden" name="skin" value=")", r2.text);
     auto token_str = find_str_after(R"(<input id="token" type="hidden" name="token" value=")",
                                     r2.text);
-    std::cout << "URL : " << url_str << '\n';
-    std::cout << "SKIN : " << skin_str << '\n';
-    std::cout << "TOKEN : " << token_str << '\n';
+    // std::cout << "URL : " << url_str << '\n';
+    // std::cout << "SKIN : " << skin_str << '\n';
+    // std::cout << "TOKEN : " << token_str << '\n';
 
+    spdlog::info("Visiting {}", r2.url.c_str());
     session.SetUrl(r2.url);
     session.SetParameters(cpr::Parameters{{"url", url_str},
                                           {"timezone", "2"},
                                           {"skin", skin_str},
                                           {"token", token_str},
-                                          {"user", creds.username},
+                                          {"user", creds.email},
                                           {"password", creds.password}});
     auto p = session.Post();
-    std::cout << "post responded with " << p.status_code << '\n';
+    // std::cout << "post responded with " << p.status_code << '\n';
 
     auto relay_state = find_str_after(R"(<input type="hidden" name="RelayState" value=")", p.text);
     auto saml_response = find_str_after(R"(<input type="hidden" name="SAMLResponse" value=")",
                                         p.text);
 
-    boost::replace_all(relay_state, "amp;", "");
-    boost::replace_all(saml_response, "amp;", "");
+    escape_ampersands(relay_state);
+    escape_ampersands(saml_response);
     session.SetUrl(cpr::Url("https://upel.agh.edu.pl/auth/saml2/sp/saml2-acs.php/upel.agh.edu.pl"));
     cpr::Parameters param = {{"RelayState", relay_state}, {"SAMLResponse", saml_response}};
     session.SetParameters(cpr::Parameters{}); // Reset parameters
     auto content = param.GetContent(*session.GetCurlHolder().get());
     session.SetBody(cpr::Body(content));
     auto p2 = session.Post();
-    std::cout << "Status code : " << p2.status_code << '\n';
-    std::cout << "New url : " << p2.url.str() << '\n';
-    std::cout << "Took (s) : " << p2.elapsed << '\n';
+    switch(p2.status_code){
+        case 200:
+            break;
+        case 404:
+            fmt::print(fg(fmt::color::red), "Got 404: Invalid email/password");
+        default:
+            exit(1);
+    }
+    // std::cout << "Status code : " << p2.status_code << '\n';
+    // std::cout << "New url : " << p2.url.str() << '\n';
+    // std::cout << "Took (s) : " << p2.elapsed << '\n';
+    fmt::print("Login requests took {}s\n", upel_login_page_request.elapsed + r2.elapsed + p.elapsed + p2.elapsed);
 
     session.SetUrl(p2.url);
     auto courses = session.Get();
@@ -201,24 +213,56 @@ std::optional<std::string> get_course_items(cpr::Session &session,
         fmt::print(stderr, "Could not find any attendance sites\n");
         exit(1);
     }
+    auto used_url = std::find_if(attendance.begin(), attendance.end(), [](auto &name_url) {
+        auto &str = name_url.name;
+        return str.find("Test programu studenta") != std::string::npos;
+    });
+    if (used_url == attendance.end()) {
+        fmt::print(stderr, "Could not find attendance containing specified parameters, exiting");
+        exit(2);
+    }
     if (attendance.size() > 1) {
         // TODO:
     }
-    fmt::print("Using attendance {}\n", attendance[0].name);
-    std::string attendance_url{attendance[0].url.data(), attendance[0].url.size()};
-    return attendance_url;
+    fmt::print("Using attendance: {} ({})\n", used_url->name, used_url->url);
+    //    std::string attendance_url{attendance[0].url.data(), attendance[0].url.size()};
+    return std::string(used_url->url);
 }
 
-int main(int argc, char *argv[])
+void register_attendance(cpr::Session &session,
+                         const std::string &attendance_url,
+                         const std::string &session_key)
 {
-    if (argc < 2) {
-        fmt::print(stderr, "Usage: {} <credentials filepath>\n", argv[0]);
-        return -1;
+    session.SetUrl(cpr::Url{attendance_url});
+    auto attendance_page = session.Get();
+    const auto &html = attendance_page.text;
+    auto start = html.find(R"(href="https://upel.agh.edu.pl/mod/attendance/attendance.php?sessid=)");
+    if (start == std::string::npos) {
+        fmt::print(stderr, "Could not find attendance link, exiting :(\n");
+        return;
     }
+    start = html.find('"', start + 1);
+    auto end = html.find('"', start + 1);
+    auto url = html.substr(start, end - start);
+    boost::replace_all(url, "amp;", "");
+    fmt::print("Found url {}\n", url);
+    session.SetUrl(cpr::Url(url));
+    auto r = session.Get();
+    fmt::print("Visited url, got back {} status code\n", r.status_code);
+}
+
+int main(int argc, const char *argv[])
+{
+    State state(argc, argv);
+    // if (argc < 2) {
+    //     fmt::print(stderr, "Usage: {} <credentials filepath>\n", argv[0]);
+    //     return -1;
+    // }
     //    spdlog::info("Welcome to spdlog!");
 
-    const fs::path credentials_path{argv[1]};
-    Credentials creds(credentials_path);
+    // const fs::path credentials_path{argv[1]};
+    // Credentials creds(credentials_path);
+    auto &creds = state.creds;
     ondemand::parser json_parser{};
     auto [session, sesskey] = login(creds);
     auto courses = get_courses(session, sesskey, json_parser);
@@ -227,7 +271,8 @@ int main(int argc, char *argv[])
     });
     assert(cpp_it != courses.end());
     auto cpp_id = cpp_it->second;
-    get_course_items(session, cpp_id, sesskey, json_parser);
+    auto attendence_url = get_course_items(session, cpp_id, sesskey, json_parser).value();
+    register_attendance(session, attendence_url, sesskey);
 
     return 0;
 }

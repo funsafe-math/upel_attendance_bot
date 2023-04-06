@@ -22,9 +22,10 @@ find_package(fmt)
 find_package(nlohmann_json 3.2.0 REQUIRED)
 find_package(spdlog REQUIRED)
 
-add_executable(upel_bot src/main.cpp)
+add_executable(upel_bot src/main.cpp src/state.hpp)
 target_link_libraries(upel_bot PRIVATE cpr::cpr fmt::fmt nlohmann_json::nlohmann_json spdlog::spdlog simdjson)
-target_compile_options(upel_bot PRIVATE -Wall -Wextra -Wpedantic -Weffc++)
+#target_compile_options(upel_bot PRIVATE -Wall -Wextra -Wpedantic -Weffc++)
+target_compile_options(upel_bot PRIVATE -Wall -Wextra -Wpedantic)
 
 #install(TARGETS upel_bot
 #    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
