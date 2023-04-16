@@ -240,7 +240,7 @@ void register_attendance(cpr::Session &session, const std::string &attendance_ur
 int main(int argc, const char *argv[]) {
   Credentials creds;
   if (argc < 2) {
-    fmt::print(stderr, "Usage: {} <credentials filepath>\nNo credentials path proviced, please enter your credentials manually instead\n", argv[0]);
+    fmt::print(stderr, "Usage: {} <credentials filepath>\nNo credentials path provided, please enter your credentials manually instead\n", argv[0]);
     fmt::print("Email: ");
     std::string email;
     std::cin >> email;
